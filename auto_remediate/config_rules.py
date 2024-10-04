@@ -1,14 +1,11 @@
 import json
 import sys
-
 import boto3
 from botocore.exceptions import ClientError
-
 
 class ConfigRules:
     def __init__(self, logging):
         self.logging = logging
-
         self._client_rds = None
         self._client_s3 = None
         self._client_sts = None
@@ -41,173 +38,91 @@ class ConfigRules:
 
     @property
     def region(self):
-        if self.client_sts.meta.region_name != "aws-global":
-            return self.client_sts.meta.region_name
-        else:
-            return "us-east-1"
+        return self.client_sts.meta.region_name if self.client_sts.meta.region_name != "aws-global" else "us-east-1"
 
     def rds_instance_public_access_check(self, resource_id):
-        """Sets Publicly Accessible option to False for public RDS Instances
-        
-        Arguments:
-            resource_id {DbiResourceId} -- The AWS Region-unique, immutable identifier for the DB instance
-        
-        Returns:
-            boolean -- True if remediation was successful
-        """
+        """Sets Publicly Accessible option to False for public RDS Instances"""
         try:
             paginator = self.client_rds.get_paginator("describe_db_instances")
             response = paginator.paginate(DBInstanceIdentifier=resource_id)
-        except:
-            self.logging.error("Could not describe RDS DB Instances.")
-            return False
-        else:
             for instance in response["DBInstances"]:
-                try:
-                    self.client_rds.modify_db_instance(
-                        DBInstanceIdentifier=instance["DBInstanceIdentifier"],
-                        PubliclyAccessible=False,
-                    )
-                    self.logging.info(
-                        f"Disabled Public Accessibility for RDS Instance '{resource_id}'."
-                    )
-                    return True
-                except:
-                    self.logging.error(
-                        f"Could not disable Public Accessibility for RDS Instance '{resource_id}'."
-                    )
-                    self.logging.error(sys.exc_info()[1])
-                    return False
+                self.client_rds.modify_db_instance(
+                    DBInstanceIdentifier=instance["DBInstanceIdentifier"],
+                    PubliclyAccessible=False
+                )
+                self.logging.info(f"Disabled Public Accessibility for RDS Instance '{resource_id}'.")
+            return True
+        except ClientError as e:
+            self.logging.error(f"RDS Instance public access check failed for {resource_id}: {e}")
+        except Exception as e:
+            self.logging.error(f"Unexpected error in RDS public access check for {resource_id}: {e}")
+        return False
 
     def s3_bucket_server_side_encryption_enabled(self, resource_id):
-        """Enables Server-side Encryption for an S3 Bucket
-        
-        Arguments:
-            resource_id {string} -- S3 Bucket name
-        
-        Returns:
-            boolean -- True if remediation is successful
-        """
+        """Enables Server-side Encryption for an S3 Bucket"""
         try:
             self.client_s3.put_bucket_encryption(
                 Bucket=resource_id,
                 ServerSideEncryptionConfiguration={
-                    "Rules": [
-                        {
-                            "ApplyServerSideEncryptionByDefault": {
-                                "SSEAlgorithm": "AES256"
-                            }
-                        }
-                    ]
-                },
+                    "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]
+                }
             )
-            self.logging.info(
-                f"Enabled Server-side Encryption for S3 Bucket '{resource_id}'."
-            )
+            self.logging.info(f"Enabled Server-side Encryption for S3 Bucket '{resource_id}'.")
             return True
-        except:
-            self.logging.info(
-                f"Could not enable Server-side Encryption for S3 Bucket '{resource_id}'."
-            )
-            self.logging.error(sys.exc_info()[1])
-            return False
+        except ClientError as e:
+            self.logging.error(f"Failed to enable encryption on S3 Bucket '{resource_id}': {e}")
+        except Exception as e:
+            self.logging.error(f"Unexpected error enabling encryption on S3 Bucket '{resource_id}': {e}")
+        return False
 
     def s3_bucket_ssl_requests_only(self, resource_id):
-        """Adds Bucket Policy to force SSL only connections
-        
-        Arguments:
-            resource_id {string} -- S3 Bucket name
-        
-        Returns:
-            boolean -- True if remediation was successful
-        """
-
-        # get SSL policy
+        """Adds Bucket Policy to force SSL-only connections"""
         policy_file = "auto_remediate/data/s3_bucket_ssl_requests_only_policy.json"
-        with open(policy_file, "r") as file:
-            policy = file.read()
-
-        policy = json.loads(policy.replace("_BUCKET_", resource_id))
-
         try:
+            with open(policy_file, "r") as file:
+                policy = json.loads(file.read().replace("_BUCKET_", resource_id))
             response = self.client_s3.get_bucket_policy(Bucket=resource_id)
-        except ClientError as error:
-            if error.response["Error"]["Code"] == "NoSuchBucketPolicy":
-                return self.set_bucket_policy(resource_id, json.dumps(policy))
-            else:
-                self.logging.error(
-                    f"Could not set SSL requests only policy to S3 Bucket '{resource_id}'."
-                )
-                self.logging.error(sys.exc_info()[1])
-                return False
-        except:
-            self.logging.error(
-                f"Could not retrieve existing policy to S3 Bucket '{resource_id}'."
-            )
-        else:
             existing_policy = json.loads(response["Policy"])
             existing_policy["Statement"].append(policy["Statement"][0])
-
             return self.set_bucket_policy(resource_id, json.dumps(existing_policy))
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchBucketPolicy":
+                return self.set_bucket_policy(resource_id, json.dumps(policy))
+            self.logging.error(f"Failed to set SSL policy on S3 Bucket '{resource_id}': {e}")
+        except Exception as e:
+            self.logging.error(f"Unexpected error setting SSL policy on S3 Bucket '{resource_id}': {e}")
+        return False
 
     def set_bucket_policy(self, bucket, policy):
-        """Attempts to set an S3 Bucket Policy. If returned error is Access Denied, 
-        then the Public Access Block is removed before placing a new S3 Bucket Policy
-        
-        Arguments:
-            bucket {string} -- S3 Bucket Name
-            policy {string} -- S3 Bucket Policy
-        
-        Returns:
-            boolean -- True if S3 Bucket Policy was set
-        """
+        """Sets an S3 Bucket Policy, handling access issues"""
         try:
             self.client_s3.put_bucket_policy(Bucket=bucket, Policy=policy)
-            self.logging.info(f"Set SSL requests only policy to S3 Bucket '{bucket}'.")
+            self.logging.info(f"Set SSL requests-only policy to S3 Bucket '{bucket}'.")
             return True
-        except ClientError as error:
-            if error.response["Error"]["Code"] == "AccessDenied":
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "AccessDenied":
                 try:
-                    # disable Public Access Block
                     self.client_s3.put_public_access_block(
                         Bucket=bucket,
                         PublicAccessBlockConfiguration={
                             "BlockPublicPolicy": False,
-                            "RestrictPublicBuckets": False,
-                        },
+                            "RestrictPublicBuckets": False
+                        }
                     )
-
-                    # put Bucket Policy
                     self.client_s3.put_bucket_policy(Bucket=bucket, Policy=policy)
-
-                    # enable Public Access Block
                     self.client_s3.put_public_access_block(
                         Bucket=bucket,
                         PublicAccessBlockConfiguration={
                             "BlockPublicPolicy": True,
-                            "RestrictPublicBuckets": True,
-                        },
+                            "RestrictPublicBuckets": True
+                        }
                     )
-
-                    self.logging.info(
-                        f"Set SSL requests only policy to S3 Bucket '{bucket}'."
-                    )
+                    self.logging.info(f"Set SSL requests-only policy to S3 Bucket '{bucket}'.")
                     return True
-                except:
-                    self.logging.error(
-                        f"Could not set SSL requests only policy to S3 Bucket '{bucket}'."
-                    )
-                    self.logging.error(sys.exc_info()[1])
-                    return False
+                except Exception as e:
+                    self.logging.error(f"Failed to set SSL-only policy after access issue for '{bucket}': {e}")
             else:
-                self.logging.error(
-                    f"Could not set SSL requests only policy to S3 Bucket '{bucket}'."
-                )
-                self.logging.error(sys.exc_info()[1])
-                return False
-        except:
-            self.logging.error(
-                f"Could not set SSL requests only policy to S3 Bucket '{bucket}'."
-            )
-            self.logging.error(sys.exc_info()[1])
-            return False
+                self.logging.error(f"Access issue setting policy on S3 Bucket '{bucket}': {e}")
+        except Exception as e:
+            self.logging.error(f"Unexpected error setting policy on S3 Bucket '{bucket}': {e}")
+        return False
